@@ -1,0 +1,294 @@
+image: node:10
+
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE: ${CI_REGISTRY}/${CI_PROJECT_PATH}
+  IMAGE_TAG: ${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}-${CI_PIPELINE_IID}
+  ENV: ${BUILD_ENV}
+  NERKO_HOST: "https://nerkogw.smsassist.com/react-build"
+  PORTAL: "affiliate"
+
+cache:
+  key: ${CI_PROJECT_NAME}
+  paths:
+    - .npm/
+
+build:
+  tags:
+    - docker-runner
+  stage:
+    build
+  only:
+    variables:
+      - $BUILD_NERKO
+  allow_failure:
+    false
+  before_script:
+    - echo 'install dependence';
+    - npm i lerna -g --cache .npm --prefer-offline;
+    - npm config set puppeteer_skip_chromium_download true;
+    - cd ./affiliate
+    - npm set registry http://52.72.34.63:83/
+    - npm ci --production --cache .npm --prefer-offline;
+    - |
+      if [ "$BUILD_ALL" == "true" ]; then
+        lerna bootstrap --hoist --ci --registry="http://52.72.34.63:83/" -- --cache .npm --prefer-offline;
+      elif [ "$BUILD_PROJECTS" ]; then
+        lerna ls --scope "{@core/*,@affiliate/{$BUILD_PROJECTS,}}";
+        lerna bootstrap --hoist --scope "{@core/*,@affiliate/{$BUILD_PROJECTS,}}" --ci --registry="http://52.72.34.63:83/" -- --cache .npm --prefer-offline;
+      else
+        lerna bootstrap --hoist --scope "{@core/*,}" --ci --registry="http://52.72.34.63:83/" -- --cache .npm --prefer-offline;
+      fi
+  script:
+    - echo "build start ${CI_PROJECT_NAME} ${BUILD_PROJECTS}...";
+    - NODE_ENV=${BUILD_ENV} npm run resource ${BUILD_PROJECTS};
+    - |
+      if [ "$BUILD_ALL" == "true" -o "$BUILD_PROJECTS" ]; then
+        NODE_ENV=${BUILD_ENV} npm run build ${BUILD_PROJECTS};
+      fi
+    - |
+      if [ "$BUILD_PUBLIC" == "true" ]; then
+        NODE_ENV=${BUILD_ENV} npm run build-public;
+      fi
+    - echo 'build complete';
+    - echo 'start to build manifest index';
+    - NODE_ENV=${BUILD_ENV} NODE_PID=${CI_PIPELINE_ID} npm run ci
+    - echo 'build manifest success';
+  artifacts:
+    paths:
+      - ./affiliate/dist_temp/
+      - ./affiliate/dist/
+      - ./affiliate/versions/
+      - ./affiliate/manifest.json
+    expire_in: 4 week
+
+list-project:
+  tags:
+    - linux
+  stage:
+    build
+  only:
+    changes:
+      - affiliate/packages/**/*
+  except:
+    variables:
+      - $REFRESHCDN
+      - $BUILD_NERKO
+      - $S3_TEST
+      - $VERSION_ROLLBACK
+  before_script:
+    - cd ./affiliate
+  script:
+    - echo 'project list';
+    - npm run refresh-projectlist;
+  artifacts:
+    paths:
+      - ./affiliate/plist.json
+
+deploy:
+  tags:
+    - linux
+  stage:
+    deploy
+  only:
+    variables:
+      - $BUILD_NERKO
+  before_script:
+    - echo 'start to deploy new version';
+  script:
+    - |
+      if [ "$BUILD_ENV" == "dev" ]; then
+        export AWS_DEFAULT_PROFILE=dev
+        [ -d ./affiliate/dist/app ] && scp -r ./affiliate/dist/app API-DEV:~/nerko/cdn/dist/${PORTAL}/;
+        scp -r ./affiliate/dist/sources API-DEV:~/nerko/cdn/dist/${PORTAL}/;
+        scp -r ./affiliate/dist_temp/* API-DEV:~/nerko/cdn/dist/${PORTAL}/;
+        aws s3 cp ./affiliate/manifest.json s3://sms.strlt.sys.onecdn/frontend/${PORTAL}/ --profile dev;
+        aws s3 sync ./affiliate/versions s3://sms.strlt.sys.onecdn/frontend/${PORTAL}/versions --profile dev;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+        curl https://affiliate-onedev.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "stage" ]; then
+        export AWS_DEFAULT_PROFILE=stage
+        aws s3 sync ./affiliate/dist s3://onestage.smsassist.com.onecdn/frontend/${PORTAL} --exclude "*" --include "app/*" --include "sources/*" --include "theme/*" --profile stage;
+        aws s3 rm s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile stage;
+        aws s3 cp ./affiliate/manifest.json s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/ --profile stage;
+        aws s3 sync ./affiliate/versions s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/versions --profile stage;
+        aws s3 sync ./affiliate/dist_temp s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/ --profile stage;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+        curl https://affiliate-onestage.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "test" ]; then
+        export AWS_DEFAULT_PROFILE=prod
+        aws s3 sync ./affiliate/dist s3://one.smsassist.com.onecdn/frontend/${PORTAL} --exclude "*" --include "app/*" --include "sources/*" --include "theme/*" --profile prod;        
+        aws s3 rm s3://one.smsassist.com.onecdn/frontend/${PORTAL}/premanifest.json --profile prod;
+        mv ./affiliate/manifest.json ./affiliate/premanifest.json;
+        aws s3 cp ./affiliate/premanifest.json s3://one.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        aws s3 sync ./affiliate/versions s3://one.smsassist.com.onecdn/frontend/${PORTAL}/versions --profile prod;
+        aws s3 sync ./affiliate/dist_temp s3://one.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+        curl https://affiliate-onetest.smsassist.com/Diagnostics/RefreshCdn?isPreview=true;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "democenter" ]; then
+        export AWS_DEFAULT_PROFILE=prod
+        aws s3 sync ./affiliate/dist s3://one.smsassist.com.onecdn/frontend/${PORTAL} --exclude "*" --include "app/*" --include "sources/*" --include "theme/*" --profile prod;        
+        aws s3 rm s3://democenter.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile prod;
+        aws s3 cp ./affiliate/manifest.json s3://democenter.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        aws s3 sync ./affiliate/versions s3://democenter.smsassist.com.onecdn/frontend/${PORTAL}/versions --profile prod;
+        aws s3 sync ./affiliate/dist_temp s3://one.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+
+      fi
+    - |
+      if [ "$BUILD_ENV" == "devDemocenter" ]; then
+        export AWS_DEFAULT_PROFILE=democenter
+        aws s3 sync ./affiliate/dist s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL} --exclude "*" --include "app/*" --include "sources/*" --include "theme/*" --profile democenter;
+        aws s3 rm s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile democenter;
+        aws s3 cp ./affiliate/manifest.json s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/ --profile democenter;
+        aws s3 sync ./affiliate/versions s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/versions --profile democenter;
+        aws s3 sync ./affiliate/dist_temp s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/ --profile democenter;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "live" ]; then
+        export AWS_DEFAULT_PROFILE=prod
+        aws s3 sync ./affiliate/dist s3://one.smsassist.com.onecdn/frontend/${PORTAL} --exclude "*" --include "app/*" --include "sources/*" --include "theme/*" --profile prod;        
+        aws s3 rm s3://one.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile prod;
+        aws s3 cp ./affiliate/manifest.json s3://one.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        aws s3 sync ./affiliate/versions s3://one.smsassist.com.onecdn/frontend/${PORTAL}/versions --profile prod;
+        aws s3 sync ./affiliate/dist_temp s3://one.smsassist.com.onecdn/frontend/${PORTAL}/ --profile prod;
+        manifest=$(ls ./affiliate/versions) && echo "manifest file is ${manifest}";
+        curl -d "pipeline_id=${CI_PIPELINE_ID}&manifest=/versions/${manifest}" ${NERKO_HOST}/automation/createNewVersion;
+        aws ssm send-command --document-name "AWS-RunRemoteScript" --document-version "1" --targets '[{"Key":"tag:Portal","Values":["Affiliate"]}]' --parameters '{"sourceType":["S3"],"sourceInfo":["{\n \"path\": \"https://s3.amazonaws.com/one.smsassist.com.files.attachments/refreshcdn.ps1\"\n}"],"commandLine":["powershell.exe refreshcdn.ps1 81"],"workingDirectory":[""],"executionTimeout":["3600"]}' --timeout-seconds 600 --max-concurrency "50" --max-errors "0" --region us-east-1 --profile prod;
+      fi
+    - echo 'deploy to cdn completely';
+
+deploy-list-project:
+  tags:
+    - linux
+  stage:
+    deploy
+  only:
+    changes:
+      - affiliate/packages/**/*
+  except:
+    variables:
+      - $REFRESHCDN
+      - $BUILD_NERKO
+      - $S3_TEST
+      - $VERSION_ROLLBACK
+  before_script:
+    - echo 'start to push list project';
+  script:
+    - mv ./affiliate/plist.json ./affiliate/${CI_COMMIT_REF_NAME//\//\~}.json
+    - scp -r ./affiliate/${CI_COMMIT_REF_NAME//\//\~}.json API-DEV:~/nerko/cdn/dist/micro-config/plist/${PORTAL}
+
+deploy-s3-test:
+  tags:
+    - linux
+  stage:
+    deploy
+  only:
+    variables:
+      - $S3_TEST
+  before_script:
+    - echo 'start to test S3';
+  script:
+    - |
+      if [ "$BUILD_ALL" == "true" -o "$BUILD_PROJECTS" ]; then
+        echo 'hello?';
+      fi
+    - $S3_COMMAND
+
+version-rollback:
+  tags:
+    - linux
+  stage:
+    deploy
+  only:
+    variables:
+      - $VERSION_ROLLBACK
+      - $VERSION
+      - $BUILD_ENV
+  except:
+    variables:
+      - $REFRESHCDN
+      - $BUILD_NERKO
+      - $S3_TEST
+  before_script:
+    - echo "start to rollback version to $VERSION";
+  script:
+    - |
+      if [ "$BUILD_ENV" == "dev" ]; then
+        aws s3 cp s3://sms.strlt.sys.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://sms.strlt.sys.onecdn/frontend/${PORTAL}/manifest.json --profile dev;
+        curl https://affiliate-onedev.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "stage" ]; then
+        aws s3 cp s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://onestage.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile stage;
+        curl https://affiliate-onestage.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "test" ]; then
+        aws s3 cp s3://one.smsassist.com.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://one.smsassist.com.onecdn/frontend/${PORTAL}/premanifest.json --profile prod;
+        curl https://affiliate-onetest.smsassist.com/Diagnostics/RefreshCdn?isPreview=true;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "democenter" ]; then
+        aws s3 cp s3://democenter.smsassist.com.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://democenter.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile prod;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "devDemocenter" ]; then
+        aws s3 cp s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://onedemocenterdev.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile democenter;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "live" ]; then
+        aws s3 cp s3://one.smsassist.com.onecdn/frontend/${PORTAL}/versions/manifest.$VERSION.json s3://one.smsassist.com.onecdn/frontend/${PORTAL}/manifest.json --profile prod;
+        aws ssm send-command --document-name "AWS-RunRemoteScript" --document-version "1" --targets '[{"Key":"tag:Portal","Values":["Affiliate"]}]' --parameters '{"sourceType":["S3"],"sourceInfo":["{\n \"path\": \"https://s3.amazonaws.com/one.smsassist.com.files.attachments/refreshcdn.ps1\"\n}"],"commandLine":["powershell.exe refreshcdn.ps1 81"],"workingDirectory":[""],"executionTimeout":["3600"]}' --timeout-seconds 600 --max-concurrency "50" --max-errors "0" --region us-east-1 --profile prod;
+      fi
+    - echo "rollback to ${VERSION} successfully";
+
+refresh-cdn:
+  tags:
+    - linux
+  stage:
+    deploy
+  only:
+    variables:
+      - $REFRESHCDN
+      - $BUILD_ENV
+  except:
+    variables:
+      - $VERSION_ROLLBACK
+      - $BUILD_NERKO
+      - $S3_TEST
+  before_script:
+    - echo "start to refresh cdn cache";
+  script:
+    - |
+      if [ "$BUILD_ENV" == "dev" ]; then
+        curl https://affiliate-onedev.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "stage" ]; then
+        curl https://affiliate-onestage.smsassist.com/Diagnostics/RefreshCdn;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "test" ]; then
+        curl https://affiliate-onetest.smsassist.com/Diagnostics/RefreshCdn?isPreview=true;
+      fi
+    - |
+      if [ "$BUILD_ENV" == "live" ]; then
+        aws ssm send-command --document-name "AWS-RunRemoteScript" --document-version "1" --targets '[{"Key":"tag:Portal","Values":["Affiliate"]}]' --parameters '{"sourceType":["S3"],"sourceInfo":["{\n \"path\": \"https://s3.amazonaws.com/one.smsassist.com.files.attachments/refreshcdn.ps1\"\n}"],"commandLine":["powershell.exe refreshcdn.ps1 81"],"workingDirectory":[""],"executionTimeout":["3600"]}' --timeout-seconds 600 --max-concurrency "50" --max-errors "0" --region us-east-1 --profile prod;
+      fi
+    - echo "refresh cdn cache pipeline successfully";

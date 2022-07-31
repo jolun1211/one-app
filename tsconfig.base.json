@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "skipLibCheck": true,
+    "outDir": "./dist/",
+    "sourceMap": true,
+    "noImplicitAny": false,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "removeComments": false,
+    "resolveJsonModule": true,
+    "downlevelIteration": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "es5",
+    "jsx": "react",
+    "experimentalDecorators": true,
+    "paths": {
+      "@common/enums/*": [
+        "src/common/enum/*"
+      ],
+      "@common/utils/*": [
+        "src/common/utils/*"
+      ],
+      "@http": [
+        "src/common/utils/http.ts"
+      ],
+      "@store/*": [
+        "src/store/*"
+      ],
+      "@pages/*/index": [
+        "src/pages/*/index"
+      ],
+    },
+    "lib": [
+      "es5",
+      "es2017",
+      "dom",
+      "scripthost"
+    ]
+  },
+  "exclude": [
+    "node_modules",
+    // "./src/**/*/node_modules/**/*"
+  ]
+}
